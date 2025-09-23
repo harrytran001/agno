@@ -304,11 +304,43 @@ class PgVector(VectorDb):
                     try:
                         # Prepare documents for insertion
                         batch_records = []
-                        for doc in batch_docs:
+                        
+                        if self.use_batch and hasattr(self.embedder, 'get_embeddings_batch_and_usage'):
+                            # Use batch embedding when enabled and supported
                             try:
-                                batch_records.append(self._get_document_record(doc, filters, content_hash))
+                                # Extract content from all documents
+                                doc_contents = [doc.content for doc in batch_docs]
+                                
+                                # Get batch embeddings and usage
+                                embeddings, usages = self.embedder.get_embeddings_batch_and_usage(doc_contents)
+                                
+                                # Process documents with pre-computed embeddings
+                                for i, doc in enumerate(batch_docs):
+                                    try:
+                                        if i < len(embeddings):
+                                            doc.embedding = embeddings[i]
+                                            doc.usage = usages[i] if i < len(usages) else None
+                                        
+                                        # Create record without calling embed() since we already have embeddings
+                                        batch_records.append(self._get_document_record_with_embedding(doc, filters, content_hash))
+                                    except Exception as e:
+                                        logger.error(f"Error processing document '{doc.name}' with batch embedding: {e}")
+                                        
                             except Exception as e:
-                                logger.error(f"Error processing document '{doc.name}': {e}")
+                                logger.warning(f"Batch embedding failed, falling back to individual embeddings: {e}")
+                                # Fall back to individual embedding
+                                for doc in batch_docs:
+                                    try:
+                                        batch_records.append(self._get_document_record(doc, filters, content_hash))
+                                    except Exception as e:
+                                        logger.error(f"Error processing document '{doc.name}': {e}")
+                        else:
+                            # Use individual embedding (original behavior)
+                            for doc in batch_docs:
+                                try:
+                                    batch_records.append(self._get_document_record(doc, filters, content_hash))
+                                except Exception as e:
+                                    logger.error(f"Error processing document '{doc.name}': {e}")
 
                         # Insert the batch of records
                         insert_stmt = postgresql.insert(self.table)
@@ -432,11 +464,43 @@ class PgVector(VectorDb):
                     try:
                         # Prepare documents for upserting
                         batch_records_dict: Dict[str, Dict[str, Any]] = {}  # Use dict to deduplicate by ID
-                        for doc in batch_docs:
+                        
+                        if self.use_batch and hasattr(self.embedder, 'get_embeddings_batch_and_usage'):
+                            # Use batch embedding when enabled and supported
                             try:
-                                batch_records_dict[doc.id] = self._get_document_record(doc, filters, content_hash)  # type: ignore
+                                # Extract content from all documents
+                                doc_contents = [doc.content for doc in batch_docs]
+                                
+                                # Get batch embeddings and usage
+                                embeddings, usages = self.embedder.get_embeddings_batch_and_usage(doc_contents)
+                                
+                                # Process documents with pre-computed embeddings
+                                for i, doc in enumerate(batch_docs):
+                                    try:
+                                        if i < len(embeddings):
+                                            doc.embedding = embeddings[i]
+                                            doc.usage = usages[i] if i < len(usages) else None
+                                        
+                                        # Create record without calling embed() since we already have embeddings
+                                        batch_records_dict[doc.id] = self._get_document_record_with_embedding(doc, filters, content_hash)  # type: ignore
+                                    except Exception as e:
+                                        logger.error(f"Error processing document '{doc.name}' with batch embedding: {e}")
+                                        
                             except Exception as e:
-                                logger.error(f"Error processing document '{doc.name}': {e}")
+                                logger.warning(f"Batch embedding failed, falling back to individual embeddings: {e}")
+                                # Fall back to individual embedding
+                                for doc in batch_docs:
+                                    try:
+                                        batch_records_dict[doc.id] = self._get_document_record(doc, filters, content_hash)  # type: ignore
+                                    except Exception as e:
+                                        logger.error(f"Error processing document '{doc.name}': {e}")
+                        else:
+                            # Use individual embedding (original behavior)
+                            for doc in batch_docs:
+                                try:
+                                    batch_records_dict[doc.id] = self._get_document_record(doc, filters, content_hash)  # type: ignore
+                                except Exception as e:
+                                    logger.error(f"Error processing document '{doc.name}': {e}")
 
                         # Convert dict to list for upsert
                         batch_records = list(batch_records_dict.values())
@@ -474,6 +538,32 @@ class PgVector(VectorDb):
         self, doc: Document, filters: Optional[Dict[str, Any]] = None, content_hash: str = ""
     ) -> Dict[str, Any]:
         doc.embed(embedder=self.embedder)
+        cleaned_content = self._clean_content(doc.content)
+        record_id = doc.id or content_hash
+
+        meta_data = doc.meta_data or {}
+        if filters:
+            meta_data.update(filters)
+
+        return {
+            "id": record_id,
+            "name": doc.name,
+            "meta_data": doc.meta_data,
+            "filters": filters,
+            "content": cleaned_content,
+            "embedding": doc.embedding,
+            "usage": doc.usage,
+            "content_hash": content_hash,
+            "content_id": doc.content_id,
+        }
+
+    def _get_document_record_with_embedding(
+        self, doc: Document, filters: Optional[Dict[str, Any]] = None, content_hash: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Create a document record using pre-computed embeddings (skip the embed() call).
+        Used when batch embeddings have already been computed.
+        """
         cleaned_content = self._clean_content(doc.content)
         record_id = doc.id or content_hash
 
