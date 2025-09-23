@@ -55,7 +55,7 @@ class PgVector(VectorDb):
         schema_version: int = 1,
         auto_upgrade_schema: bool = False,
         reranker: Optional[Reranker] = None,
-        use_batch: bool = False,
+        enable_batch_embeddings: bool = True,
     ):
         """
         Initialize the PgVector instance.
@@ -96,7 +96,7 @@ class PgVector(VectorDb):
         self.db_url: Optional[str] = db_url
         self.db_engine: Engine = db_engine
         self.metadata: MetaData = MetaData(schema=self.schema)
-        self.use_batch: bool = use_batch
+        self.enable_batch_embeddings: bool = enable_batch_embeddings
 
         # Embedder for embedding the document contents
         if embedder is None:
@@ -285,7 +285,7 @@ class PgVector(VectorDb):
         content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
-        batch_size: int = 1000,
+        batch_size: int = 100,
     ) -> None:
         """
         Insert documents into the database.
@@ -304,43 +304,11 @@ class PgVector(VectorDb):
                     try:
                         # Prepare documents for insertion
                         batch_records = []
-                        
-                        if self.use_batch and hasattr(self.embedder, 'get_embeddings_batch_and_usage'):
-                            # Use batch embedding when enabled and supported
+                        for doc in batch_docs:
                             try:
-                                # Extract content from all documents
-                                doc_contents = [doc.content for doc in batch_docs]
-                                
-                                # Get batch embeddings and usage
-                                embeddings, usages = self.embedder.get_embeddings_batch_and_usage(doc_contents)
-                                
-                                # Process documents with pre-computed embeddings
-                                for i, doc in enumerate(batch_docs):
-                                    try:
-                                        if i < len(embeddings):
-                                            doc.embedding = embeddings[i]
-                                            doc.usage = usages[i] if i < len(usages) else None
-                                        
-                                        # Create record without calling embed() since we already have embeddings
-                                        batch_records.append(self._get_document_record_with_embedding(doc, filters, content_hash))
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}' with batch embedding: {e}")
-                                        
+                                batch_records.append(self._get_document_record(doc, filters, content_hash))
                             except Exception as e:
-                                logger.warning(f"Batch embedding failed, falling back to individual embeddings: {e}")
-                                # Fall back to individual embedding
-                                for doc in batch_docs:
-                                    try:
-                                        batch_records.append(self._get_document_record(doc, filters, content_hash))
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}': {e}")
-                        else:
-                            # Use individual embedding (original behavior)
-                            for doc in batch_docs:
-                                try:
-                                    batch_records.append(self._get_document_record(doc, filters, content_hash))
-                                except Exception as e:
-                                    logger.error(f"Error processing document '{doc.name}': {e}")
+                                logger.error(f"Error processing document '{doc.name}': {e}")
 
                         # Insert the batch of records
                         insert_stmt = postgresql.insert(self.table)
@@ -360,7 +328,7 @@ class PgVector(VectorDb):
         content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
-        batch_size: int = 10000,
+        batch_size: int = 1000,
     ) -> None:
         """Insert documents asynchronously with parallel embedding."""
         try:
@@ -369,104 +337,34 @@ class PgVector(VectorDb):
                     batch_docs = documents[i : i + batch_size]
                     log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
                     try:
+                        # Embed all documents in the batch
+                        await self._async_embed_documents(batch_docs)
+
                         # Prepare documents for insertion
                         batch_records = []
-                        
-                        if self.use_batch and hasattr(self.embedder, 'async_get_embeddings_batch_and_usage'):
-                            # Use batch embedding when enabled and supported
+                        for doc in batch_docs:
                             try:
-                                # Extract content from all documents
-                                doc_contents = [doc.content for doc in batch_docs]
-                                
-                                # Get batch embeddings and usage
-                                embeddings, usages = await self.embedder.async_get_embeddings_batch_and_usage(doc_contents)
-                                
-                                # Process documents with pre-computed embeddings
-                                for j, doc in enumerate(batch_docs):
-                                    try:
-                                        if j < len(embeddings):
-                                            doc.embedding = embeddings[j]
-                                            doc.usage = usages[j] if j < len(usages) else None
-                                        
-                                        cleaned_content = self._clean_content(doc.content)
-                                        record_id = doc.id or content_hash
+                                cleaned_content = self._clean_content(doc.content)
+                                record_id = doc.id or content_hash
 
-                                        meta_data = doc.meta_data or {}
-                                        if filters:
-                                            meta_data.update(filters)
+                                meta_data = doc.meta_data or {}
+                                if filters:
+                                    meta_data.update(filters)
 
-                                        record = {
-                                            "id": record_id,
-                                            "name": doc.name,
-                                            "meta_data": doc.meta_data,
-                                            "filters": filters,
-                                            "content": cleaned_content,
-                                            "embedding": doc.embedding,
-                                            "usage": doc.usage,
-                                            "content_hash": content_hash,
-                                            "content_id": doc.content_id,
-                                        }
-                                        batch_records.append(record)
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}' with batch embedding: {e}")
-                                        
+                                record = {
+                                    "id": record_id,
+                                    "name": doc.name,
+                                    "meta_data": doc.meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                    "content_id": doc.content_id,
+                                }
+                                batch_records.append(record)
                             except Exception as e:
-                                logger.warning(f"Async batch embedding failed, falling back to individual embeddings: {e}")
-                                # Fall back to individual embedding
-                                embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
-                                await asyncio.gather(*embed_tasks, return_exceptions=True)
-
-                                for doc in batch_docs:
-                                    try:
-                                        cleaned_content = self._clean_content(doc.content)
-                                        record_id = doc.id or content_hash
-
-                                        meta_data = doc.meta_data or {}
-                                        if filters:
-                                            meta_data.update(filters)
-
-                                        record = {
-                                            "id": record_id,
-                                            "name": doc.name,
-                                            "meta_data": doc.meta_data,
-                                            "filters": filters,
-                                            "content": cleaned_content,
-                                            "embedding": doc.embedding,
-                                            "usage": doc.usage,
-                                            "content_hash": content_hash,
-                                            "content_id": doc.content_id,
-                                        }
-                                        batch_records.append(record)
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}': {e}")
-                        else:
-                            # Use individual embedding (original behavior)
-                            embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
-                            await asyncio.gather(*embed_tasks, return_exceptions=True)
-
-                            for doc in batch_docs:
-                                try:
-                                    cleaned_content = self._clean_content(doc.content)
-                                    record_id = doc.id or content_hash
-
-                                    meta_data = doc.meta_data or {}
-                                    if filters:
-                                        meta_data.update(filters)
-
-                                    record = {
-                                        "id": record_id,
-                                        "name": doc.name,
-                                        "meta_data": doc.meta_data,
-                                        "filters": filters,
-                                        "content": cleaned_content,
-                                        "embedding": doc.embedding,
-                                        "usage": doc.usage,
-                                        "content_hash": content_hash,
-                                        "content_id": doc.content_id,
-                                    }
-                                    batch_records.append(record)
-                                except Exception as e:
-                                    logger.error(f"Error processing document '{doc.name}': {e}")
+                                logger.error(f"Error processing document '{doc.name}': {e}")
 
                         # Insert the batch of records
                         if batch_records:
@@ -496,7 +394,7 @@ class PgVector(VectorDb):
         content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
-        batch_size: int = 1000,
+        batch_size: int = 100,
     ) -> None:
         """
         Upsert documents by content hash.
@@ -516,7 +414,7 @@ class PgVector(VectorDb):
         content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
-        batch_size: int = 1000,
+        batch_size: int = 100,
     ) -> None:
         """
         Upsert (insert or update) documents in the database.
@@ -534,43 +432,11 @@ class PgVector(VectorDb):
                     try:
                         # Prepare documents for upserting
                         batch_records_dict: Dict[str, Dict[str, Any]] = {}  # Use dict to deduplicate by ID
-                        
-                        if self.use_batch and hasattr(self.embedder, 'get_embeddings_batch_and_usage'):
-                            # Use batch embedding when enabled and supported
+                        for doc in batch_docs:
                             try:
-                                # Extract content from all documents
-                                doc_contents = [doc.content for doc in batch_docs]
-                                
-                                # Get batch embeddings and usage
-                                embeddings, usages = self.embedder.get_embeddings_batch_and_usage(doc_contents)
-                                
-                                # Process documents with pre-computed embeddings
-                                for i, doc in enumerate(batch_docs):
-                                    try:
-                                        if i < len(embeddings):
-                                            doc.embedding = embeddings[i]
-                                            doc.usage = usages[i] if i < len(usages) else None
-                                        
-                                        # Create record without calling embed() since we already have embeddings
-                                        batch_records_dict[doc.id] = self._get_document_record_with_embedding(doc, filters, content_hash)  # type: ignore
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}' with batch embedding: {e}")
-                                        
+                                batch_records_dict[doc.id] = self._get_document_record(doc, filters, content_hash)  # type: ignore
                             except Exception as e:
-                                logger.warning(f"Batch embedding failed, falling back to individual embeddings: {e}")
-                                # Fall back to individual embedding
-                                for doc in batch_docs:
-                                    try:
-                                        batch_records_dict[doc.id] = self._get_document_record(doc, filters, content_hash)  # type: ignore
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}': {e}")
-                        else:
-                            # Use individual embedding (original behavior)
-                            for doc in batch_docs:
-                                try:
-                                    batch_records_dict[doc.id] = self._get_document_record(doc, filters, content_hash)  # type: ignore
-                                except Exception as e:
-                                    logger.error(f"Error processing document '{doc.name}': {e}")
+                                logger.error(f"Error processing document '{doc.name}': {e}")
 
                         # Convert dict to list for upsert
                         batch_records = list(batch_records_dict.values())
@@ -627,31 +493,50 @@ class PgVector(VectorDb):
             "content_id": doc.content_id,
         }
 
-    def _get_document_record_with_embedding(
-        self, doc: Document, filters: Optional[Dict[str, Any]] = None, content_hash: str = ""
-    ) -> Dict[str, Any]:
+    async def _async_embed_documents(self, batch_docs: List[Document]) -> None:
         """
-        Create a document record using pre-computed embeddings (skip the embed() call).
-        Used when batch embeddings have already been computed.
+        Embed a batch of documents using either batch embedding or individual embedding.
+
+        Args:
+            batch_docs: List of documents to embed
         """
-        cleaned_content = self._clean_content(doc.content)
-        record_id = doc.id or content_hash
+        if self.enable_batch_embeddings and hasattr(self.embedder, "async_get_embeddings_batch_and_usage"):
+            # Use batch embedding when enabled and supported
+            try:
+                # Extract content from all documents
+                doc_contents = [doc.content for doc in batch_docs]
 
-        meta_data = doc.meta_data or {}
-        if filters:
-            meta_data.update(filters)
+                # Get batch embeddings and usage
+                embeddings, usages = await self.embedder.async_get_embeddings_batch_and_usage(doc_contents)
 
-        return {
-            "id": record_id,
-            "name": doc.name,
-            "meta_data": doc.meta_data,
-            "filters": filters,
-            "content": cleaned_content,
-            "embedding": doc.embedding,
-            "usage": doc.usage,
-            "content_hash": content_hash,
-            "content_id": doc.content_id,
-        }
+                # Process documents with pre-computed embeddings
+                for j, doc in enumerate(batch_docs):
+                    try:
+                        if j < len(embeddings):
+                            doc.embedding = embeddings[j]
+                            doc.usage = usages[j] if j < len(usages) else None
+                    except Exception as e:
+                        logger.error(f"Error assigning batch embedding to document '{doc.name}': {e}")
+
+            except Exception as e:
+                # Check if this is a rate limit error - don't fall back as it would make things worse
+                error_str = str(e).lower()
+                is_rate_limit = any(phrase in error_str for phrase in [
+                    'rate limit', 'too many requests', '429', 'trial key', 'api calls / minute'
+                ])
+                
+                if is_rate_limit:
+                    logger.error(f"Rate limit detected during batch embedding.  {e}")
+                    raise e
+                else:
+                    logger.warning(f"Async batch embedding failed, falling back to individual embeddings: {e}")
+                    # Fall back to individual embedding
+                    embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
+                    await asyncio.gather(*embed_tasks, return_exceptions=True)
+        else:
+            # Use individual embedding (original behavior)
+            embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
+            await asyncio.gather(*embed_tasks, return_exceptions=True)
 
     async def async_upsert(
         self,
@@ -674,7 +559,7 @@ class PgVector(VectorDb):
         content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
-        batch_size: int = 1000,
+        batch_size: int = 100,
     ) -> None:
         """
         Upsert (insert or update) documents in the database.
@@ -690,104 +575,34 @@ class PgVector(VectorDb):
                     batch_docs = documents[i : i + batch_size]
                     log_info(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
                     try:
+                        # Embed all documents in the batch
+                        await self._async_embed_documents(batch_docs)
+
                         # Prepare documents for upserting
                         batch_records_dict = {}  # Use dict to deduplicate by ID
-                        
-                        if self.use_batch and hasattr(self.embedder, 'async_get_embeddings_batch_and_usage'):
-                            # Use batch embedding when enabled and supported
+                        for doc in batch_docs:
                             try:
-                                # Extract content from all documents
-                                doc_contents = [doc.content for doc in batch_docs]
-                                
-                                # Get batch embeddings and usage
-                                embeddings, usages = await self.embedder.async_get_embeddings_batch_and_usage(doc_contents)
-                                
-                                # Process documents with pre-computed embeddings
-                                for j, doc in enumerate(batch_docs):
-                                    try:
-                                        if j < len(embeddings):
-                                            doc.embedding = embeddings[j]
-                                            doc.usage = usages[j] if j < len(usages) else None
-                                        
-                                        cleaned_content = self._clean_content(doc.content)
-                                        record_id = md5(cleaned_content.encode()).hexdigest()
+                                cleaned_content = self._clean_content(doc.content)
+                                record_id = md5(cleaned_content.encode()).hexdigest()
 
-                                        meta_data = doc.meta_data or {}
-                                        if filters:
-                                            meta_data.update(filters)
+                                meta_data = doc.meta_data or {}
+                                if filters:
+                                    meta_data.update(filters)
 
-                                        record = {
-                                            "id": record_id,  # use record_id as a reproducible id to avoid duplicates while upsert
-                                            "name": doc.name,
-                                            "meta_data": doc.meta_data,
-                                            "filters": filters,
-                                            "content": cleaned_content,
-                                            "embedding": doc.embedding,
-                                            "usage": doc.usage,
-                                            "content_hash": content_hash,
-                                            "content_id": doc.content_id,
-                                        }
-                                        batch_records_dict[record_id] = record  # This deduplicates by ID
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}' with batch embedding: {e}")
-                                        
+                                record = {
+                                    "id": record_id,  # use record_id as a reproducible id to avoid duplicates while upsert
+                                    "name": doc.name,
+                                    "meta_data": doc.meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                    "content_id": doc.content_id,
+                                }
+                                batch_records_dict[record_id] = record  # This deduplicates by ID
                             except Exception as e:
-                                logger.warning(f"Async batch embedding failed, falling back to individual embeddings: {e}")
-                                # Fall back to individual embedding
-                                embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
-                                await asyncio.gather(*embed_tasks, return_exceptions=True)
-                                
-                                for doc in batch_docs:
-                                    try:
-                                        cleaned_content = self._clean_content(doc.content)
-                                        record_id = md5(cleaned_content.encode()).hexdigest()
-
-                                        meta_data = doc.meta_data or {}
-                                        if filters:
-                                            meta_data.update(filters)
-
-                                        record = {
-                                            "id": record_id,  # use record_id as a reproducible id to avoid duplicates while upsert
-                                            "name": doc.name,
-                                            "meta_data": doc.meta_data,
-                                            "filters": filters,
-                                            "content": cleaned_content,
-                                            "embedding": doc.embedding,
-                                            "usage": doc.usage,
-                                            "content_hash": content_hash,
-                                            "content_id": doc.content_id,
-                                        }
-                                        batch_records_dict[record_id] = record  # This deduplicates by ID
-                                    except Exception as e:
-                                        logger.error(f"Error processing document '{doc.name}': {e}")
-                        else:
-                            # Use individual embedding (original behavior)
-                            embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
-                            await asyncio.gather(*embed_tasks, return_exceptions=True)
-
-                            for doc in batch_docs:
-                                try:
-                                    cleaned_content = self._clean_content(doc.content)
-                                    record_id = md5(cleaned_content.encode()).hexdigest()
-
-                                    meta_data = doc.meta_data or {}
-                                    if filters:
-                                        meta_data.update(filters)
-
-                                    record = {
-                                        "id": record_id,  # use record_id as a reproducible id to avoid duplicates while upsert
-                                        "name": doc.name,
-                                        "meta_data": doc.meta_data,
-                                        "filters": filters,
-                                        "content": cleaned_content,
-                                        "embedding": doc.embedding,
-                                        "usage": doc.usage,
-                                        "content_hash": content_hash,
-                                        "content_id": doc.content_id,
-                                    }
-                                    batch_records_dict[record_id] = record  # This deduplicates by ID
-                                except Exception as e:
-                                    logger.error(f"Error processing document '{doc.name}': {e}")
+                                logger.error(f"Error processing document '{doc.name}': {e}")
 
                         # Convert dict to list for upsert
                         batch_records = list(batch_records_dict.values())
